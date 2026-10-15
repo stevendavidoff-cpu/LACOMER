@@ -34,9 +34,13 @@ Settings are read from catalogo.json -> "camara" (all optional):
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
+
+# Hide libcamera's INFO chatter; warnings and errors still show.
+os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:WARN")
 
 import cv2
 
@@ -167,20 +171,47 @@ class Camara:
             return self._cam.autofocus_cycle()
         return True
 
-    def capturar(self):
-        """Return one frame as a BGR numpy array."""
+    def capturar(self, intentos=3, espera=5.0):
+        """Return one frame as a BGR numpy array.
+
+        Retries if a capture hangs (corrupted frame from the sensor) or comes
+        back black/blank, which can happen with a loose ribbon cable.
+        """
         if self._cam is None:
             self.abrir()
         if self.tipo == "picamera2":
-            if self.cfg.get("enfoque") == "auto":
-                self.enfocar()
-            return self._cam.capture_array("main")
+            ultimo_error = None
+            for n in range(1, intentos + 1):
+                try:
+                    if self.cfg.get("enfoque") == "auto":
+                        self.enfocar()
+                    frame = self._capturar_con_tiempo(espera)
+                    if frame is not None and frame.mean() > 3:   # not black
+                        return frame
+                    ultimo_error = "black or empty frame"
+                except Exception as e:  # timeout or libcamera failure
+                    ultimo_error = e
+                print(f"  capture attempt {n} failed ({ultimo_error}), retrying...", file=sys.stderr)
+                time.sleep(0.5)
+            raise RuntimeError(
+                f"Camera failed {intentos} times ({ultimo_error}). "
+                "Reseat the ribbon cable and check the power supply (vcgencmd get_throttled)."
+            )
         ok, frame = self._cam.read()
         if not ok:
             raise RuntimeError("Could not read a frame from the USB camera")
         if int(self.cfg.get("rotacion", 0)) % 360 == 180:
             frame = cv2.rotate(frame, cv2.ROTATE_180)
         return frame
+
+    def _capturar_con_tiempo(self, espera):
+        """capture_array with a timeout so a lost frame can't freeze the program."""
+        try:
+            trabajo = self._cam.capture_array("main", wait=False)
+            return self._cam.wait(trabajo, timeout=espera)
+        except TypeError:
+            # older Picamera2 without wait/timeout arguments
+            return self._cam.capture_array("main")
 
     def guardar_foto(self, ruta, calidad=92):
         frame = self.capturar()
